@@ -113,6 +113,12 @@ protected:
     // One Hailo stage per pyramid level for which a HEF is available
     // (currently L0..L3). Entries beyond this vector use cv::FAST on CPU.
     std::vector<std::unique_ptr<HailoFeatureExtractor>> mHailoStages;
+
+    // Per-frame, per-level outcome of the Hailo inference performed inside
+    // ComputePyramid(). 0=ok, 1=no_wrapper, 2=run_failed, 3=shape_mismatch.
+    // Read by ComputeKeyPointsOctTree() to decide whether to use the cached
+    // heatmap or fall back to cv::FAST.
+    std::vector<int> mHailoOutcomeThisFrame;
 };
 
 } //namespace ORB_SLAM

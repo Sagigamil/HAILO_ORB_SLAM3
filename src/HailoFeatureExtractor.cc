@@ -85,6 +85,7 @@ HailoFeatureExtractor::HailoFeatureExtractor(const std::string& hef_path)
     mOutputs.clear();
     mImpl->output_frame_sizes.clear();
     mHeatmapOutputIndex = -1;
+    mResizeOutputIndex  = -1;
     for (const auto& info : out_infos.value()) {
         const std::string name(info.name);
         size_t frame_size = mImpl->infer_model->output(name)->get_frame_size();
@@ -94,12 +95,17 @@ HailoFeatureExtractor::HailoFeatureExtractor(const std::string& hef_path)
         ob.width    = info.shape.width;
         ob.features = info.shape.features;
         ob.data.assign(frame_size, 0);
+        const bool is_uint8_one_channel =
+            ob.features == 1 && frame_size == ob.height * ob.width;
         if (mHeatmapOutputIndex < 0 &&
+            is_uint8_one_channel &&
             ob.height == mInputHeight &&
-            ob.width  == mInputWidth &&
-            ob.features == 1 &&
-            frame_size == mInputHeight * mInputWidth) {
+            ob.width  == mInputWidth) {
             mHeatmapOutputIndex = static_cast<int>(mOutputs.size());
+        } else if (mResizeOutputIndex < 0 &&
+                   is_uint8_one_channel &&
+                   (ob.height != mInputHeight || ob.width != mInputWidth)) {
+            mResizeOutputIndex = static_cast<int>(mOutputs.size());
         }
         mOutputs.push_back(std::move(ob));
         mImpl->output_frame_sizes.push_back(frame_size);
@@ -130,6 +136,11 @@ HailoFeatureExtractor::HailoFeatureExtractor(const std::string& hef_path)
         std::cerr << "[HailoFeatureExtractor] WARNING: no output matches the input "
                   << mInputHeight << "x" << mInputWidth << "x1 raster; "
                      "GetHeatmap() will return empty\n";
+    }
+    if (mResizeOutputIndex >= 0) {
+        const auto& ob = mOutputs[mResizeOutputIndex];
+        std::cerr << "[HailoFeatureExtractor] resize output  = '" << ob.name
+                  << "' (" << ob.height << "x" << ob.width << ")\n";
     }
 }
 
@@ -225,6 +236,16 @@ cv::Mat HailoFeatureExtractor::GetHeatmap()
     OutputBuffer& ob = mOutputs[mHeatmapOutputIndex];
     return cv::Mat(static_cast<int>(mInputHeight),
                    static_cast<int>(mInputWidth),
+                   CV_8UC1,
+                   ob.data.data());
+}
+
+cv::Mat HailoFeatureExtractor::GetResize()
+{
+    if (mResizeOutputIndex < 0) return cv::Mat();
+    OutputBuffer& ob = mOutputs[mResizeOutputIndex];
+    return cv::Mat(static_cast<int>(ob.height),
+                   static_cast<int>(ob.width),
                    CV_8UC1,
                    ob.data.data());
 }

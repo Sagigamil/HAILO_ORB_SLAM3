@@ -905,13 +905,15 @@ namespace ORB_SLAM3
             vector<cv::KeyPoint> vToDistributeKeys;
             vToDistributeKeys.reserve(nfeatures*10);
 
+            // Inference for level<mHailoStages.size() already ran in
+            // ComputePyramid(); just consult the cached outcome + heatmap.
             bool hailo_used = false;
             if (level < (int)mHailoStages.size()) {
+                const int outcome = level < (int)mHailoOutcomeThisFrame.size()
+                                        ? mHailoOutcomeThisFrame[level] : 1;
                 HailoFeatureExtractor *stage = mHailoStages[level].get();
-                if (!stage) {
-                    g_hailo_counter.record(level, 1);
-                } else if (!stage->Run(mvImagePyramid[level])) {
-                    g_hailo_counter.record(level, 2);
+                if (outcome != 0 || !stage) {
+                    g_hailo_counter.record(level, outcome);
                 } else {
                     cv::Mat heat = stage->GetHeatmap();
                     if (heat.empty() ||
@@ -1311,6 +1313,9 @@ namespace ORB_SLAM3
 
     void ORBextractor::ComputePyramid(cv::Mat image)
     {
+        // Reset per-frame Hailo outcomes; default = no_wrapper.
+        mHailoOutcomeThisFrame.assign(nlevels, 1);
+
         for (int level = 0; level < nlevels; ++level)
         {
             float scale = mvInvScaleFactor[level];
@@ -1319,21 +1324,47 @@ namespace ORB_SLAM3
             Mat temp(wholeSize, image.type()), masktemp;
             mvImagePyramid[level] = temp(Rect(EDGE_THRESHOLD, EDGE_THRESHOLD, sz.width, sz.height));
 
-            // Compute the resized image
-            if( level != 0 )
-            {
-                resize(mvImagePyramid[level-1], mvImagePyramid[level], sz, 0, 0, INTER_LINEAR);
-
+            // Populate the level's inner image. For level 0 we use the input
+            // image; for levels >=1 we prefer the previous Hailo stage's
+            // resize1 output (avoids an OpenCV resize), else we fall back to
+            // cv::resize on CPU.
+            bool used_npu_resize = false;
+            if (level > 0 &&
+                level - 1 < (int)mHailoStages.size() &&
+                mHailoStages[level - 1] &&
+                mHailoOutcomeThisFrame[level - 1] == 0) {
+                cv::Mat npu_resize = mHailoStages[level - 1]->GetResize();
+                if (!npu_resize.empty() &&
+                    npu_resize.rows == sz.height &&
+                    npu_resize.cols == sz.width &&
+                    npu_resize.type() == CV_8UC1) {
+                    npu_resize.copyTo(mvImagePyramid[level]);
+                    used_npu_resize = true;
+                }
+            }
+            if (level == 0) {
+                copyMakeBorder(image, temp, EDGE_THRESHOLD, EDGE_THRESHOLD, EDGE_THRESHOLD, EDGE_THRESHOLD,
+                               BORDER_REFLECT_101);
+            } else {
+                if (!used_npu_resize) {
+                    resize(mvImagePyramid[level-1], mvImagePyramid[level], sz, 0, 0, INTER_LINEAR);
+                }
                 copyMakeBorder(mvImagePyramid[level], temp, EDGE_THRESHOLD, EDGE_THRESHOLD, EDGE_THRESHOLD, EDGE_THRESHOLD,
                                BORDER_REFLECT_101+BORDER_ISOLATED);
             }
-            else
-            {
-                copyMakeBorder(image, temp, EDGE_THRESHOLD, EDGE_THRESHOLD, EDGE_THRESHOLD, EDGE_THRESHOLD,
-                               BORDER_REFLECT_101);
-            }
-        }
 
+            // Run inference at this level so the heatmap is ready for
+            // ComputeKeyPointsOctTree, and resize1 is ready for the next
+            // iteration's input.
+            if (level < (int)mHailoStages.size() && mHailoStages[level]) {
+                if (mHailoStages[level]->Run(mvImagePyramid[level])) {
+                    mHailoOutcomeThisFrame[level] = 0;   // ok
+                } else {
+                    mHailoOutcomeThisFrame[level] = 2;   // run_failed
+                }
+            }
+            // else: no_wrapper (default 1)
+        }
     }
 
 } //namespace ORB_SLAM

@@ -44,6 +44,11 @@ public:
     // Empty if the model has no NHWC HxWx1 output matching the input size.
     cv::Mat GetHeatmap();
 
+    // Non-owning view over the downscaled-image output ('resize1'),
+    // laid out as an HxW UINT8 raster at the next pyramid level's resolution.
+    // Empty if the model has no UINT8 1-feature output smaller than the input.
+    cv::Mat GetResize();
+
     size_t GetInputHeight() const { return mInputHeight; }
     size_t GetInputWidth()  const { return mInputWidth; }
 
@@ -56,6 +61,7 @@ private:
     size_t mInputWidth   = 0;
     size_t mInputChannels = 0;
     int mHeatmapOutputIndex = -1;
+    int mResizeOutputIndex  = -1;
     long long mFrameCount = 0;
 };
 
