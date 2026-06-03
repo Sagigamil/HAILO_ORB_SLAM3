@@ -110,7 +110,9 @@ protected:
     std::vector<float> mvLevelSigma2;
     std::vector<float> mvInvLevelSigma2;
 
-    std::unique_ptr<HailoFeatureExtractor> mHailoL0;
+    // One Hailo stage per pyramid level for which a HEF is available
+    // (currently L0..L3). Entries beyond this vector use cv::FAST on CPU.
+    std::vector<std::unique_ptr<HailoFeatureExtractor>> mHailoStages;
 };
 
 } //namespace ORB_SLAM

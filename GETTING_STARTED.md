@@ -1,10 +1,20 @@
 # Getting Started — Hailo-accelerated ORB-SLAM3
 
-This fork offloads **FAST keypoint detection at pyramid level 0** from CPU to a
-**Hailo-8** NPU. The Hailo HEF produces a per-pixel corner-weight heatmap; a 3×3
-NMS over that heatmap replaces the cell-based `cv::FAST` scan upstream uses.
-Pyramid levels 1..N-1 still run `cv::FAST` on CPU, and the descriptor pipeline
-is unchanged.
+This fork offloads **FAST keypoint detection at pyramid levels 0–3** from CPU
+to a **Hailo-8** NPU. Each level has its own HEF that takes the level's
+grayscale image and produces a per-pixel corner-weight heatmap; a 3×3 NMS over
+that heatmap replaces the cell-based `cv::FAST` scan upstream uses. Pyramid
+levels 4..N-1 still run `cv::FAST` on CPU, and the descriptor pipeline is
+unchanged.
+
+The four HEFs are wired up at scaleFactor 1.2 (the default in `TUM1.yaml`):
+
+| Level | Input dims | HEF |
+|-------|-----------:|-----|
+| 0 | 480×640 | `Hailo/dense_fast_stage_L0.hef` |
+| 1 | 400×533 | `Hailo/dense_fast_stage_L1.hef` |
+| 2 | 333×444 | `Hailo/dense_fast_stage_L2.hef` |
+| 3 | 278×370 | `Hailo/dense_fast_stage_L3.hef` |
 
 If the HEF or device isn't available, the extractor transparently falls back to
 the upstream `cv::FAST` path on every level, so SLAM still runs.
@@ -88,19 +98,21 @@ At the end of the run you'll see:
 
 ```
 Images in the sequence: 792
-New Map created with 833 points
-median tracking time: 0.038...
-mean tracking time:   0.039...
+New Map created with 832 points
+median tracking time: 0.055...
+mean tracking time:   0.057...
 
-[ORBextractor] level-0 path tally over 792 frames:
-  hailo_ok       = 792
-  fallback_init  = 0  (mHailoL0 null)
-  fallback_run   = 0  (Run() returned false)
-  fallback_shape = 0  (heatmap dims mismatch)
+[ORBextractor] Hailo per-level path tally
+  level | hailo_ok | fb_init | fb_run | fb_shape
+  ------+----------+---------+--------+---------
+    0   |      792 |       0 |      0 |        0
+    1   |      792 |       0 |      0 |        0
+    2   |      792 |       0 |      0 |        0
+    3   |      792 |       0 |      0 |        0
 ```
 
-`hailo_ok = total frames` confirms every frame's level-0 keypoints came from
-the NPU.
+`hailo_ok = total frames` on every row confirms every frame's keypoints at
+levels 0–3 came from the NPU.
 
 ### GUI vs headless
 
@@ -115,20 +127,27 @@ Rebuild with `cmake --build build --target rgbd_tum -j$(nproc)` after toggling.
 
 ## 4. Configuration
 
-### `ORB_SLAM3_HAILO_L0_HEF`
+### `ORB_SLAM3_HAILO_L<N>_HEF`  (N = 0, 1, 2, 3)
 
-Path to the HEF the extractor loads. Defaults to `Hailo/dense_fast_stage_L0.hef`
-(checked in to this branch). Override if you have a custom build:
+Per-stage HEF path. Default is `Hailo/dense_fast_stage_L<N>.hef` relative to
+cwd (all four are checked in on this branch). Override any of them:
 
 ```bash
-export ORB_SLAM3_HAILO_L0_HEF=/abs/path/to/your.hef
+export ORB_SLAM3_HAILO_L0_HEF=/abs/path/to/L0.hef
+export ORB_SLAM3_HAILO_L1_HEF=/abs/path/to/L1.hef
+# levels not overridden fall back to the defaults
 ./Examples/RGB-D/rgbd_tum ...
 ```
 
-Constraints on the HEF:
-- Single input named `*/input_layer1`, UINT8, **480×640×1**
-- One output that's UINT8 **NHWC 480×640×1** (the heatmap — recognised by name `activation1` or by matching the input dims)
-- Other outputs are tolerated and ignored
+If a HEF fails to load (missing file, wrong arch, etc.), that level alone
+falls back to `cv::FAST` on CPU — the other levels keep running on the NPU.
+
+Constraints on each HEF:
+- Single UINT8 input matching `mvImagePyramid[level]` dims
+  (480×640, 400×533, 333×444, 278×370 for L0..L3 at scaleFactor 1.2)
+- One UINT8 output with the same HxW as the input and 1 feature
+  (the corner heatmap — recognised by matching dims; name is also `activation1`)
+- Extra outputs are tolerated and ignored
 
 ### `HAILO_MONITOR`
 
@@ -162,8 +181,8 @@ Files of interest:
 |---|---|
 | `include/HailoFeatureExtractor.h`, `src/HailoFeatureExtractor.cc` | Thin C++ wrapper around HailoRT async-infer: loads HEF, runs sync inference on one 480×640 grayscale frame, exposes `activation1` as a `cv::Mat` view. |
 | `src/ORBextractor.cc` — `ExtractKeypointsFromHailoHeatmap()` | 3×3 NMS scan over the heatmap inside `[minBorderX, maxBorderX) × [minBorderY, maxBorderY)`. Emits `cv::KeyPoint`s with `.response` = heatmap byte. |
-| `src/ORBextractor.cc` — `ComputeKeyPointsOctTree()` | For `level == 0` runs the Hailo wrapper; on success skips the upstream cell-based `cv::FAST` loop. Levels 1..N-1 unchanged. |
-| `Hailo/dense_fast_stage_L0.hef` | The compiled model. 480×640 grayscale in, two outputs: `resize1` (next pyramid stage's image, ignored here) and `activation1` (corner heatmap). |
+| `src/ORBextractor.cc` — `ComputeKeyPointsOctTree()` | For each level with a Hailo wrapper, runs inference and skips the upstream cell-based `cv::FAST` loop. Levels without a wrapper (4..N-1) and any level whose wrapper failed at runtime use the upstream `cv::FAST` path. |
+| `Hailo/dense_fast_stage_L<N>.hef` | One compiled model per pyramid level. Each consumes its level's grayscale image and emits `resize1` (next stage's image, ignored — we use ORB-SLAM3's own pyramid) and `activation1` (corner heatmap at the level's resolution). |
 | `CMakeLists.txt` | `find_package(HailoRT REQUIRED)`, links `HailoRT::libhailort`. |
 
 The Hailo wrapper creates the `VDevice` with `group_id="SHARED"` +
@@ -190,15 +209,17 @@ lsmod | grep hailo                # hailo_pci should be loaded
 dmesg | grep -i hailo | tail
 ```
 
-**Level-0 path tally shows `fallback_init` > 0**
-The HEF couldn't be loaded. The error preceding the tally explains why
-(missing file, wrong arch, etc.).
+**Path tally shows `fb_init > 0` for some level**
+That level's HEF couldn't be loaded. The error preceding the tally explains
+why (missing file, wrong arch, etc.). That level falls back to `cv::FAST` on
+CPU; other levels keep running on the NPU.
 
-**Level-0 path tally shows `fallback_shape` > 0**
-The HEF's output dimensions don't match `mvImagePyramid[0]`. This HEF expects
-480×640 input. If you're running on a different camera resolution either
-recompile the HEF for that resolution, or set the YAML's `Camera.newWidth` /
-`Camera.newHeight` to 640 / 480.
+**Path tally shows `fb_shape > 0` for some level**
+The HEF's output dimensions don't match `mvImagePyramid[level]`. The bundled
+HEFs target ORB-SLAM3's standard pyramid at scaleFactor 1.2 (480×640 →
+400×533 → 333×444 → 278×370). If you're running on a different camera
+resolution or scale factor, recompile the HEFs for those dims, or set the
+YAML's `Camera.newWidth` / `Camera.newHeight` to 640 / 480.
 
 **Pangolin/Qt segfault during shutdown**
 Long-standing Pangolin bug independent of this fork. Disable the viewer

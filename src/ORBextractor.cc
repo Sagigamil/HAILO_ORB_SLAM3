@@ -58,6 +58,7 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <vector>
 #include <iostream>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 
@@ -434,16 +435,26 @@ namespace ORB_SLAM3
 
         mvImagePyramid.resize(nlevels);
 
-        const char *hef_env = std::getenv("ORB_SLAM3_HAILO_L0_HEF");
-        const std::string hef_path = hef_env ? hef_env
-            : std::string("Hailo/dense_fast_stage_L0.hef");
-        try {
-            mHailoL0 = std::unique_ptr<HailoFeatureExtractor>(
-                new HailoFeatureExtractor(hef_path));
-        } catch (const std::exception& e) {
-            std::cerr << "[ORBextractor] Hailo L0 disabled (init failed): "
-                      << e.what() << "\n";
-            mHailoL0.reset();
+        // One Hailo stage per pyramid level for which a HEF exists.
+        // Per-stage HEF path is configurable via ORB_SLAM3_HAILO_L<N>_HEF;
+        // default is Hailo/dense_fast_stage_L<N>.hef relative to cwd.
+        const int kHailoStages = 4;
+        mHailoStages.resize(std::min(kHailoStages, nlevels));
+        for (int stage = 0; stage < (int)mHailoStages.size(); ++stage) {
+            char env_key[64];
+            std::snprintf(env_key, sizeof(env_key), "ORB_SLAM3_HAILO_L%d_HEF", stage);
+            const char *hef_env = std::getenv(env_key);
+            char default_path[64];
+            std::snprintf(default_path, sizeof(default_path),
+                          "Hailo/dense_fast_stage_L%d.hef", stage);
+            const std::string hef_path = hef_env ? hef_env : std::string(default_path);
+            try {
+                mHailoStages[stage].reset(new HailoFeatureExtractor(hef_path));
+            } catch (const std::exception& e) {
+                std::cerr << "[ORBextractor] Hailo L" << stage
+                          << " disabled (init failed): " << e.what() << "\n";
+                mHailoStages[stage].reset();
+            }
         }
 
         mnFeaturesPerLevel.resize(nlevels);
@@ -831,22 +842,51 @@ namespace ORB_SLAM3
     }
 
     namespace {
-        struct Level0PathCounter {
-            long long hailo_ok = 0;
-            long long fallback_init   = 0;   // mHailoL0 was null
-            long long fallback_run    = 0;   // Run() returned false
-            long long fallback_shape  = 0;   // heatmap dims didn't match input
-            ~Level0PathCounter() {
-                long long total = hailo_ok + fallback_init + fallback_run + fallback_shape;
-                if (total == 0) return;
-                std::cerr << "\n[ORBextractor] level-0 path tally over " << total << " frames:\n"
-                          << "  hailo_ok        = " << hailo_ok        << "\n"
-                          << "  fallback_init   = " << fallback_init   << "  (mHailoL0 null)\n"
-                          << "  fallback_run    = " << fallback_run    << "  (Run() returned false)\n"
-                          << "  fallback_shape  = " << fallback_shape  << "  (heatmap dims mismatch)\n";
+        struct HailoPathCounter {
+            std::vector<long long> hailo_ok;
+            std::vector<long long> fallback_init;
+            std::vector<long long> fallback_run;
+            std::vector<long long> fallback_shape;
+            std::mutex mu;
+
+            void record(int level, int outcome) {
+                std::lock_guard<std::mutex> lock(mu);
+                auto grow = [&](std::vector<long long>& v) {
+                    if ((int)v.size() <= level) v.resize(level + 1, 0);
+                };
+                grow(hailo_ok); grow(fallback_init); grow(fallback_run); grow(fallback_shape);
+                switch (outcome) {
+                    case 0: ++hailo_ok[level];       break;
+                    case 1: ++fallback_init[level];  break;
+                    case 2: ++fallback_run[level];   break;
+                    case 3: ++fallback_shape[level]; break;
+                }
+            }
+
+            ~HailoPathCounter() {
+                std::lock_guard<std::mutex> lock(mu);
+                size_t nlevels = std::max({hailo_ok.size(), fallback_init.size(),
+                                           fallback_run.size(), fallback_shape.size()});
+                if (nlevels == 0) return;
+                std::cerr << "\n[ORBextractor] Hailo per-level path tally\n";
+                std::cerr << "  level | hailo_ok | fb_init | fb_run | fb_shape\n";
+                std::cerr << "  ------+----------+---------+--------+---------\n";
+                for (size_t L = 0; L < nlevels; ++L) {
+                    long long ok = L < hailo_ok.size()       ? hailo_ok[L]       : 0;
+                    long long fi = L < fallback_init.size()  ? fallback_init[L]  : 0;
+                    long long fr = L < fallback_run.size()   ? fallback_run[L]   : 0;
+                    long long fs = L < fallback_shape.size() ? fallback_shape[L] : 0;
+                    std::cerr << "    " << L << "   | "
+                              << std::setw(8) << ok << " | "
+                              << std::setw(7) << fi << " | "
+                              << std::setw(6) << fr << " | "
+                              << std::setw(8) << fs << "\n";
+                }
+                std::cerr << "  fb_init = HEF init failed, fb_run = inference failed,"
+                          << " fb_shape = output dims didn't match pyramid image\n";
             }
         };
-        static Level0PathCounter g_level0_counter;
+        static HailoPathCounter g_hailo_counter;
     }
 
     void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint> >& allKeypoints)
@@ -866,17 +906,18 @@ namespace ORB_SLAM3
             vToDistributeKeys.reserve(nfeatures*10);
 
             bool hailo_used = false;
-            if (level == 0) {
-                if (!mHailoL0) {
-                    ++g_level0_counter.fallback_init;
-                } else if (!mHailoL0->Run(mvImagePyramid[0])) {
-                    ++g_level0_counter.fallback_run;
+            if (level < (int)mHailoStages.size()) {
+                HailoFeatureExtractor *stage = mHailoStages[level].get();
+                if (!stage) {
+                    g_hailo_counter.record(level, 1);
+                } else if (!stage->Run(mvImagePyramid[level])) {
+                    g_hailo_counter.record(level, 2);
                 } else {
-                    cv::Mat heat = mHailoL0->GetHeatmap();
+                    cv::Mat heat = stage->GetHeatmap();
                     if (heat.empty() ||
-                        heat.cols != mvImagePyramid[0].cols ||
-                        heat.rows != mvImagePyramid[0].rows) {
-                        ++g_level0_counter.fallback_shape;
+                        heat.cols != mvImagePyramid[level].cols ||
+                        heat.rows != mvImagePyramid[level].rows) {
+                        g_hailo_counter.record(level, 3);
                     } else {
                         ExtractKeypointsFromHailoHeatmap(
                             heat, minBorderX, maxBorderX, minBorderY, maxBorderY,
@@ -887,7 +928,7 @@ namespace ORB_SLAM3
                                 minThFAST, vToDistributeKeys);
                         }
                         hailo_used = true;
-                        ++g_level0_counter.hailo_ok;
+                        g_hailo_counter.record(level, 0);
                     }
                 }
             }
