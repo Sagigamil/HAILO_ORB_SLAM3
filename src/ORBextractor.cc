@@ -58,8 +58,11 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <vector>
 #include <iostream>
+#include <cstdlib>
+#include <exception>
 
 #include "ORBextractor.h"
+#include "HailoFeatureExtractor.h"
 
 
 using namespace cv;
@@ -431,6 +434,18 @@ namespace ORB_SLAM3
 
         mvImagePyramid.resize(nlevels);
 
+        const char *hef_env = std::getenv("ORB_SLAM3_HAILO_L0_HEF");
+        const std::string hef_path = hef_env ? hef_env
+            : std::string("Hailo/dense_fast_stage_L0.hef");
+        try {
+            mHailoL0 = std::unique_ptr<HailoFeatureExtractor>(
+                new HailoFeatureExtractor(hef_path));
+        } catch (const std::exception& e) {
+            std::cerr << "[ORBextractor] Hailo L0 disabled (init failed): "
+                      << e.what() << "\n";
+            mHailoL0.reset();
+        }
+
         mnFeaturesPerLevel.resize(nlevels);
         float factor = 1.0f / scaleFactor;
         float nDesiredFeaturesPerScale = nfeatures*(1 - factor)/(1 - (float)pow((double)factor, (double)nlevels));
@@ -467,6 +482,8 @@ namespace ORB_SLAM3
             ++v0;
         }
     }
+
+    ORBextractor::~ORBextractor() = default;
 
     static void computeOrientation(const Mat& image, vector<KeyPoint>& keypoints, const vector<int>& umax)
     {
@@ -778,6 +795,60 @@ namespace ORB_SLAM3
         return vResultKeys;
     }
 
+    static void ExtractKeypointsFromHailoHeatmap(
+        const cv::Mat& heat,
+        int minBorderX, int maxBorderX,
+        int minBorderY, int maxBorderY,
+        int threshold,
+        std::vector<cv::KeyPoint>& vToDistributeKeys)
+    {
+        const int x0 = std::max(minBorderX, 1);
+        const int x1 = std::min(maxBorderX, heat.cols - 1);
+        const int y0 = std::max(minBorderY, 1);
+        const int y1 = std::min(maxBorderY, heat.rows - 1);
+        const uchar th = static_cast<uchar>(std::max(0, std::min(255, threshold)));
+        const int step = static_cast<int>(heat.step);
+        const uchar* base = heat.ptr<uchar>(0);
+
+        for (int y = y0; y < y1; ++y) {
+            const uchar* row_m1 = base + (y - 1) * step;
+            const uchar* row_0  = base +  y      * step;
+            const uchar* row_p1 = base + (y + 1) * step;
+            for (int x = x0; x < x1; ++x) {
+                const uchar v = row_0[x];
+                if (v < th) continue;
+                // Strict 3x3 NMS with deterministic tie-breaking (top-left half '<=', bottom-right '<')
+                if (v <= row_m1[x - 1] || v <= row_m1[x] || v <= row_m1[x + 1] ||
+                    v <= row_0 [x - 1] || v <  row_0 [x + 1] ||
+                    v <  row_p1[x - 1] || v <  row_p1[x] || v <  row_p1[x + 1])
+                    continue;
+                vToDistributeKeys.emplace_back(
+                    static_cast<float>(x - minBorderX),
+                    static_cast<float>(y - minBorderY),
+                    7.0f, -1.0f, static_cast<float>(v));
+            }
+        }
+    }
+
+    namespace {
+        struct Level0PathCounter {
+            long long hailo_ok = 0;
+            long long fallback_init   = 0;   // mHailoL0 was null
+            long long fallback_run    = 0;   // Run() returned false
+            long long fallback_shape  = 0;   // heatmap dims didn't match input
+            ~Level0PathCounter() {
+                long long total = hailo_ok + fallback_init + fallback_run + fallback_shape;
+                if (total == 0) return;
+                std::cerr << "\n[ORBextractor] level-0 path tally over " << total << " frames:\n"
+                          << "  hailo_ok        = " << hailo_ok        << "\n"
+                          << "  fallback_init   = " << fallback_init   << "  (mHailoL0 null)\n"
+                          << "  fallback_run    = " << fallback_run    << "  (Run() returned false)\n"
+                          << "  fallback_shape  = " << fallback_shape  << "  (heatmap dims mismatch)\n";
+            }
+        };
+        static Level0PathCounter g_level0_counter;
+    }
+
     void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint> >& allKeypoints)
     {
         allKeypoints.resize(nlevels);
@@ -794,6 +865,35 @@ namespace ORB_SLAM3
             vector<cv::KeyPoint> vToDistributeKeys;
             vToDistributeKeys.reserve(nfeatures*10);
 
+            bool hailo_used = false;
+            if (level == 0) {
+                if (!mHailoL0) {
+                    ++g_level0_counter.fallback_init;
+                } else if (!mHailoL0->Run(mvImagePyramid[0])) {
+                    ++g_level0_counter.fallback_run;
+                } else {
+                    cv::Mat heat = mHailoL0->GetHeatmap();
+                    if (heat.empty() ||
+                        heat.cols != mvImagePyramid[0].cols ||
+                        heat.rows != mvImagePyramid[0].rows) {
+                        ++g_level0_counter.fallback_shape;
+                    } else {
+                        ExtractKeypointsFromHailoHeatmap(
+                            heat, minBorderX, maxBorderX, minBorderY, maxBorderY,
+                            iniThFAST, vToDistributeKeys);
+                        if (vToDistributeKeys.empty()) {
+                            ExtractKeypointsFromHailoHeatmap(
+                                heat, minBorderX, maxBorderX, minBorderY, maxBorderY,
+                                minThFAST, vToDistributeKeys);
+                        }
+                        hailo_used = true;
+                        ++g_level0_counter.hailo_ok;
+                    }
+                }
+            }
+
+            if (!hailo_used)
+            {
             const float width = (maxBorderX-minBorderX);
             const float height = (maxBorderY-minBorderY);
 
@@ -870,6 +970,7 @@ namespace ORB_SLAM3
 
                 }
             }
+            } // end if (!hailo_used)
 
             vector<KeyPoint> & keypoints = allKeypoints[level];
             keypoints.reserve(nfeatures);

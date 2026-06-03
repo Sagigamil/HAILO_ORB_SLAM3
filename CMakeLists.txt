@@ -14,16 +14,16 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
 
 # Check C++11 or C++0x support
 include(CheckCXXCompilerFlag)
-CHECK_CXX_COMPILER_FLAG("-std=c++11" COMPILER_SUPPORTS_CXX11)
-CHECK_CXX_COMPILER_FLAG("-std=c++0x" COMPILER_SUPPORTS_CXX0X)
+CHECK_CXX_COMPILER_FLAG("-std=c++14" COMPILER_SUPPORTS_CXX11)
+CHECK_CXX_COMPILER_FLAG("-std=c++14" COMPILER_SUPPORTS_CXX0X)
 if(COMPILER_SUPPORTS_CXX11)
-   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
    add_definitions(-DCOMPILEDWITHC11)
-   message(STATUS "Using flag -std=c++11.")
+   message(STATUS "Using flag -std=c++14.")
 elseif(COMPILER_SUPPORTS_CXX0X)
-   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++0x")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
    add_definitions(-DCOMPILEDWITHC0X)
-   message(STATUS "Using flag -std=c++0x.")
+   message(STATUS "Using flag -std=c++14.")
 else()
    message(FATAL_ERROR "The compiler ${CMAKE_CXX_COMPILER} has no C++11 support. Please use a different C++ compiler.")
 endif()
@@ -41,6 +41,7 @@ MESSAGE(${OpenCV_VERSION})
 find_package(Eigen3 3.1.0 REQUIRED)
 find_package(Pangolin REQUIRED)
 find_package(realsense2)
+find_package(HailoRT REQUIRED)
 
 include_directories(
 ${PROJECT_SOURCE_DIR}
@@ -59,6 +60,7 @@ src/Tracking.cc
 src/LocalMapping.cc
 src/LoopClosing.cc
 src/ORBextractor.cc
+src/HailoFeatureExtractor.cc
 src/ORBmatcher.cc
 src/FrameDrawer.cc
 src/Converter.cc
@@ -87,6 +89,7 @@ include/Tracking.h
 include/LocalMapping.h
 include/LoopClosing.h
 include/ORBextractor.h
+include/HailoFeatureExtractor.h
 include/ORBmatcher.h
 include/FrameDrawer.h
 include/Converter.h
@@ -121,6 +124,7 @@ ${EIGEN3_LIBS}
 ${Pangolin_LIBRARIES}
 ${PROJECT_SOURCE_DIR}/Thirdparty/DBoW2/lib/libDBoW2.so
 ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
+HailoRT::libhailort
 -lboost_serialization
 -lcrypto
 )

@@ -21,11 +21,14 @@
 
 #include <vector>
 #include <list>
+#include <memory>
 #include <opencv2/opencv.hpp>
 
 
 namespace ORB_SLAM3
 {
+
+class HailoFeatureExtractor;
 
 class ExtractorNode
 {
@@ -49,7 +52,7 @@ public:
     ORBextractor(int nfeatures, float scaleFactor, int nlevels,
                  int iniThFAST, int minThFAST);
 
-    ~ORBextractor(){}
+    ~ORBextractor();
 
     // Compute the ORB features and descriptors on an image.
     // ORB are dispersed on the image using an octree.
@@ -103,9 +106,11 @@ protected:
     std::vector<int> umax;
 
     std::vector<float> mvScaleFactor;
-    std::vector<float> mvInvScaleFactor;    
+    std::vector<float> mvInvScaleFactor;
     std::vector<float> mvLevelSigma2;
     std::vector<float> mvInvLevelSigma2;
+
+    std::unique_ptr<HailoFeatureExtractor> mHailoL0;
 };
 
 } //namespace ORB_SLAM
