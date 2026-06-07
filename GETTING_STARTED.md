@@ -1,37 +1,46 @@
 # Getting Started — Hailo-accelerated ORB-SLAM3
 
-This fork offloads **FAST keypoint detection and pyramid downscaling at levels
-0–3** from CPU to a **Hailo-8** NPU. The four HEFs form a chain: each takes
-its level's grayscale image and emits two outputs — a per-pixel corner-weight
-heatmap (used to extract keypoints via a 3×3 NMS, replacing the cell-based
-`cv::FAST` scan upstream uses), and a downscaled image fed as the next stage's
-input (replacing `cv::resize(..., INTER_LINEAR)`).
+This fork offloads **FAST keypoint detection, NMS, and pyramid downscaling
+across all 8 levels** from CPU to a **Hailo-8** NPU. The eight HEFs form a
+chain: each takes its level's grayscale image and emits two outputs —
+`ew_mult1` (heatmap × NMS-mask: non-maxima are zero, surviving peaks keep
+their response) and `resize1` (the downscaled image fed as the next stage's
+input, replacing `cv::resize(..., INTER_LINEAR)`).
 
-The resized image from each stage is stored in `mvImagePyramid[level+1]`, so
-the descriptor pipeline, keypoint orientation, and stereo SAD matching all
-read the NPU's downscale rather than OpenCV's. Pyramid levels 4..N-1 still run
-`cv::FAST` over a `cv::resize`-built image on CPU.
+Because NMS is applied on-chip, keypoint extraction is just a threshold + emit
+over the `ew_mult1` output — no 3×3 neighbor check on CPU. The resized image
+from each stage is stored in `mvImagePyramid[level+1]`, so the descriptor
+pipeline, keypoint orientation, and stereo SAD matching all read the NPU's
+downscale rather than OpenCV's.
 
 ```
-                +-------+     +-------+     +-------+     +-------+
-   image  ----> | L0 hef| --> | L1 hef| --> | L2 hef| --> | L3 hef|
-   (480x640)    +---+---+     +---+---+     +---+---+     +---+---+
-                    | heat        | heat        | heat        | heat
-                    v             v             v             v
-                keypoints     keypoints     keypoints     keypoints
-                (level 0)     (level 1)     (level 2)     (level 3)
+   image (480x640)
+        |
+        v
+   +-------+   resize1   +-------+   resize1        +-------+
+   | L0 hef|------------>| L1 hef|------------>...  | L7 hef|
+   +---+---+             +---+---+             ...  +---+---+
+       | ew_mult1            | ew_mult1                 | ew_mult1
+       v                     v                          v
+   keypoints L0          keypoints L1             keypoints L7
+   (threshold only,      (threshold only,         (threshold only,
+    no CPU NMS)           no CPU NMS)              no CPU NMS)
 
-   resize1 of stage N -> mvImagePyramid[N+1]  (no cv::resize for L1..L3)
+   resize1 of stage N -> mvImagePyramid[N+1]  (no cv::resize on CPU)
 ```
 
-The four HEFs are wired up at scaleFactor 1.2 (the default in `TUM1.yaml`):
+The eight HEFs are wired up at scaleFactor 1.2 (the default in `TUM1.yaml`):
 
-| Level | Input dims | HEF | resize1 (→ next stage's input) |
-|-------|-----------:|-----|-------------------------------|
+| Level | Input dims | HEF | resize1 (→ next stage) |
+|-------|-----------:|-----|------------------------|
 | 0 | 480×640 | `Hailo/dense_fast_stage_L0.hef` | 400×533 |
 | 1 | 400×533 | `Hailo/dense_fast_stage_L1.hef` | 333×444 |
 | 2 | 333×444 | `Hailo/dense_fast_stage_L2.hef` | 278×370 |
-| 3 | 278×370 | `Hailo/dense_fast_stage_L3.hef` | 231×309 (consumed by `cv::resize` for level 4 if N>4) |
+| 3 | 278×370 | `Hailo/dense_fast_stage_L3.hef` | 231×309 |
+| 4 | 231×309 | `Hailo/dense_fast_stage_L4.hef` | 193×257 |
+| 5 | 193×257 | `Hailo/dense_fast_stage_L5.hef` | 161×214 |
+| 6 | 161×214 | `Hailo/dense_fast_stage_L6.hef` | 134×179 |
+| 7 | 134×179 | `Hailo/dense_fast_stage_L7.hef` | (unused — no level 8 by default) |
 
 If the HEF or device isn't available, the extractor transparently falls back to
 the upstream `cv::FAST` path on every level, so SLAM still runs.
@@ -144,10 +153,10 @@ Rebuild with `cmake --build build --target rgbd_tum -j$(nproc)` after toggling.
 
 ## 4. Configuration
 
-### `ORB_SLAM3_HAILO_L<N>_HEF`  (N = 0, 1, 2, 3)
+### `ORB_SLAM3_HAILO_L<N>_HEF`  (N = 0..nlevels-1)
 
 Per-stage HEF path. Default is `Hailo/dense_fast_stage_L<N>.hef` relative to
-cwd (all four are checked in on this branch). Override any of them:
+cwd (all eight are checked in on this branch). Override any of them:
 
 ```bash
 export ORB_SLAM3_HAILO_L0_HEF=/abs/path/to/L0.hef
@@ -157,13 +166,18 @@ export ORB_SLAM3_HAILO_L1_HEF=/abs/path/to/L1.hef
 ```
 
 If a HEF fails to load (missing file, wrong arch, etc.), that level alone
-falls back to `cv::FAST` on CPU — the other levels keep running on the NPU.
+falls back to `cv::FAST` on CPU and the next level falls back to `cv::resize`;
+other levels keep running on the NPU.
 
 Constraints on each HEF:
 - Single UINT8 input matching `mvImagePyramid[level]` dims
-  (480×640, 400×533, 333×444, 278×370 for L0..L3 at scaleFactor 1.2)
+  (480×640, 400×533, 333×444, 278×370, 231×309, 193×257, 161×214, 134×179
+  for L0..L7 at scaleFactor 1.2)
 - One UINT8 output with the same HxW as the input and 1 feature
-  (the corner heatmap — recognised by matching dims; name is also `activation1`)
+  (the post-NMS corner heatmap — recognised by matching dims; the name in
+  the bundled HEFs is `ew_mult1`)
+- A second UINT8 output strictly smaller than the input (the downscaled image
+  for the next stage; bundled HEFs name it `resize1`)
 - Extra outputs are tolerated and ignored
 
 ### `HAILO_MONITOR`
@@ -198,9 +212,9 @@ Files of interest:
 |---|---|
 | `include/HailoFeatureExtractor.h`, `src/HailoFeatureExtractor.cc` | Thin C++ wrapper around HailoRT async-infer: loads HEF, runs sync inference on one 480×640 grayscale frame, exposes `activation1` as a `cv::Mat` view. |
 | `src/ORBextractor.cc` — `ExtractKeypointsFromHailoHeatmap()` | 3×3 NMS scan over the heatmap inside `[minBorderX, maxBorderX) × [minBorderY, maxBorderY)`. Emits `cv::KeyPoint`s with `.response` = heatmap byte. |
-| `src/ORBextractor.cc` — `ComputePyramid()` | For levels 1..3, copies the previous stage's `resize1` into `mvImagePyramid[level]` instead of running `cv::resize`. Triggers `Run()` for each stage so the heatmap is cached for `ComputeKeyPointsOctTree`. Per-frame outcomes stored in `mHailoOutcomeThisFrame`. |
-| `src/ORBextractor.cc` — `ComputeKeyPointsOctTree()` | Reads each stage's cached heatmap (no second inference). For levels without a wrapper (4..N-1) or with a runtime failure, uses the upstream `cv::FAST` path. |
-| `Hailo/dense_fast_stage_L<N>.hef` | One compiled model per pyramid level. Each consumes its level's grayscale image and emits `resize1` (consumed by stage N+1 / `mvImagePyramid[N+1]`) and `activation1` (corner heatmap at the level's resolution). |
+| `src/ORBextractor.cc` — `ComputePyramid()` | For levels 1..N-1 where the previous stage's inference succeeded, copies the previous stage's `resize1` into `mvImagePyramid[level]` instead of running `cv::resize`. Triggers `Run()` for each stage so the heatmap is cached for `ComputeKeyPointsOctTree`. Per-frame outcomes stored in `mHailoOutcomeThisFrame`. |
+| `src/ORBextractor.cc` — `ComputeKeyPointsOctTree()` | Reads each stage's cached heatmap (no second inference), threshold-only extraction (no CPU NMS since `ew_mult1` is already NMS'd). On runtime failure for any level, falls back to the upstream `cv::FAST` path for that level. |
+| `Hailo/dense_fast_stage_L<N>.hef` | One compiled model per pyramid level (N = 0..7). Each consumes its level's grayscale image and emits `resize1` (consumed by stage N+1 / `mvImagePyramid[N+1]`) and `ew_mult1` (post-NMS corner heatmap at the level's resolution; non-maxima are zero). |
 | `CMakeLists.txt` | `find_package(HailoRT REQUIRED)`, links `HailoRT::libhailort`. |
 
 The Hailo wrapper creates the `VDevice` with `group_id="SHARED"` +

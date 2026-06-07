@@ -438,8 +438,9 @@ namespace ORB_SLAM3
         // One Hailo stage per pyramid level for which a HEF exists.
         // Per-stage HEF path is configurable via ORB_SLAM3_HAILO_L<N>_HEF;
         // default is Hailo/dense_fast_stage_L<N>.hef relative to cwd.
-        const int kHailoStages = 4;
-        mHailoStages.resize(std::min(kHailoStages, nlevels));
+        // Stages whose HEF can't be loaded silently fall back to cv::FAST
+        // / cv::resize for that level.
+        mHailoStages.resize(nlevels);
         for (int stage = 0; stage < (int)mHailoStages.size(); ++stage) {
             char env_key[64];
             std::snprintf(env_key, sizeof(env_key), "ORB_SLAM3_HAILO_L%d_HEF", stage);
@@ -806,6 +807,9 @@ namespace ORB_SLAM3
         return vResultKeys;
     }
 
+    // The HEF's ew_mult1 output is heatmap * NMS_mask: non-maxima are 0,
+    // surviving peaks keep their response value. So we just threshold + emit.
+    // No CPU-side 3x3 NMS needed.
     static void ExtractKeypointsFromHailoHeatmap(
         const cv::Mat& heat,
         int minBorderX, int maxBorderX,
@@ -813,26 +817,19 @@ namespace ORB_SLAM3
         int threshold,
         std::vector<cv::KeyPoint>& vToDistributeKeys)
     {
-        const int x0 = std::max(minBorderX, 1);
-        const int x1 = std::min(maxBorderX, heat.cols - 1);
-        const int y0 = std::max(minBorderY, 1);
-        const int y1 = std::min(maxBorderY, heat.rows - 1);
+        const int x0 = std::max(minBorderX, 0);
+        const int x1 = std::min(maxBorderX, heat.cols);
+        const int y0 = std::max(minBorderY, 0);
+        const int y1 = std::min(maxBorderY, heat.rows);
         const uchar th = static_cast<uchar>(std::max(0, std::min(255, threshold)));
         const int step = static_cast<int>(heat.step);
         const uchar* base = heat.ptr<uchar>(0);
 
         for (int y = y0; y < y1; ++y) {
-            const uchar* row_m1 = base + (y - 1) * step;
-            const uchar* row_0  = base +  y      * step;
-            const uchar* row_p1 = base + (y + 1) * step;
+            const uchar* row = base + y * step;
             for (int x = x0; x < x1; ++x) {
-                const uchar v = row_0[x];
+                const uchar v = row[x];
                 if (v < th) continue;
-                // Strict 3x3 NMS with deterministic tie-breaking (top-left half '<=', bottom-right '<')
-                if (v <= row_m1[x - 1] || v <= row_m1[x] || v <= row_m1[x + 1] ||
-                    v <= row_0 [x - 1] || v <  row_0 [x + 1] ||
-                    v <  row_p1[x - 1] || v <  row_p1[x] || v <  row_p1[x + 1])
-                    continue;
                 vToDistributeKeys.emplace_back(
                     static_cast<float>(x - minBorderX),
                     static_cast<float>(y - minBorderY),
