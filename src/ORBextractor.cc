@@ -457,6 +457,15 @@ namespace ORB_SLAM3
                 mHailoStages[stage].reset();
             }
         }
+        // Build the full chip-side pipeline: stage N's HailoRT completion
+        // callback will memcpy its resize1 into stage N+1's input buffer and
+        // fire stage N+1's run_async — so the NPU sees a back-to-back stream
+        // of 8 jobs and the CPU never wakes between them.
+        for (int i = 0; i + 1 < (int)mHailoStages.size(); ++i) {
+            if (mHailoStages[i] && mHailoStages[i + 1]) {
+                mHailoStages[i]->SetNext(mHailoStages[i + 1].get());
+            }
+        }
 
         mnFeaturesPerLevel.resize(nlevels);
         float factor = 1.0f / scaleFactor;
@@ -496,6 +505,33 @@ namespace ORB_SLAM3
     }
 
     ORBextractor::~ORBextractor() = default;
+
+    bool ORBextractor::AllHailoStagesReady() const
+    {
+        if ((int)mHailoStages.size() < nlevels) return false;
+        for (const auto& s : mHailoStages) if (!s) return false;
+        return true;
+    }
+
+    void ORBextractor::PreallocatePyramidMats(const cv::Mat& image)
+    {
+        mPyramidTemps.resize(nlevels);
+        for (int level = 0; level < nlevels; ++level) {
+            const float scale = mvInvScaleFactor[level];
+            const cv::Size sz(cvRound(image.cols * scale), cvRound(image.rows * scale));
+            const cv::Size wholeSize(sz.width + EDGE_THRESHOLD * 2,
+                                     sz.height + EDGE_THRESHOLD * 2);
+            mPyramidTemps[level].create(wholeSize, image.type());
+            mvImagePyramid[level] = mPyramidTemps[level](
+                cv::Rect(EDGE_THRESHOLD, EDGE_THRESHOLD, sz.width, sz.height));
+        }
+        // Level 0: copy the input image into the inner sub-Mat AND wrap it
+        // with a reflected border in the temp. (Equivalent to upstream's
+        // ComputePyramid for level 0.)
+        cv::copyMakeBorder(image, mPyramidTemps[0],
+                           EDGE_THRESHOLD, EDGE_THRESHOLD, EDGE_THRESHOLD, EDGE_THRESHOLD,
+                           cv::BORDER_REFLECT_101);
+    }
 
     static void computeOrientation(const Mat& image, vector<KeyPoint>& keypoints, const vector<int>& umax)
     {
@@ -886,6 +922,87 @@ namespace ORB_SLAM3
         static HailoPathCounter g_hailo_counter;
     }
 
+    void ORBextractor::OnHailoStageComplete(int level,
+        std::vector<std::vector<cv::KeyPoint>>& allKeypoints)
+    {
+        HailoFeatureExtractor* stage = mHailoStages[level].get();
+
+        // 1. Populate next level's mvImagePyramid from this stage's resize1
+        //    output (with reflected border) so the descriptor pipeline and
+        //    IC_Angle read consistent bytes.
+        const int next = level + 1;
+        if (next < nlevels) {
+            cv::Mat resize_out = stage->GetResize();
+            if (!resize_out.empty() &&
+                resize_out.rows == mvImagePyramid[next].rows &&
+                resize_out.cols == mvImagePyramid[next].cols &&
+                resize_out.type() == CV_8UC1) {
+                resize_out.copyTo(mvImagePyramid[next]);
+                cv::copyMakeBorder(mvImagePyramid[next], mPyramidTemps[next],
+                                   EDGE_THRESHOLD, EDGE_THRESHOLD,
+                                   EDGE_THRESHOLD, EDGE_THRESHOLD,
+                                   cv::BORDER_REFLECT_101 + cv::BORDER_ISOLATED);
+            }
+        }
+
+        // 2. Threshold-only extraction over the post-NMS heatmap.
+        cv::Mat heat = stage->GetHeatmap();
+        const int minBorderX = EDGE_THRESHOLD - 3;
+        const int minBorderY = minBorderX;
+        const int maxBorderX = mvImagePyramid[level].cols - EDGE_THRESHOLD + 3;
+        const int maxBorderY = mvImagePyramid[level].rows - EDGE_THRESHOLD + 3;
+
+        std::vector<cv::KeyPoint> vToDistributeKeys;
+        vToDistributeKeys.reserve(nfeatures * 10);
+        ExtractKeypointsFromHailoHeatmap(heat, minBorderX, maxBorderX,
+                                         minBorderY, maxBorderY,
+                                         iniThFAST, vToDistributeKeys);
+        if (vToDistributeKeys.empty()) {
+            ExtractKeypointsFromHailoHeatmap(heat, minBorderX, maxBorderX,
+                                             minBorderY, maxBorderY,
+                                             minThFAST, vToDistributeKeys);
+        }
+
+        // 3. OctTree distribution + finalise coords.
+        auto& keypoints = allKeypoints[level];
+        keypoints.reserve(nfeatures);
+        keypoints = DistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
+                                      minBorderY, maxBorderY,
+                                      mnFeaturesPerLevel[level], level);
+
+        const int scaledPatchSize = PATCH_SIZE * mvScaleFactor[level];
+        const int nkps = (int)keypoints.size();
+        for (int i = 0; i < nkps; ++i) {
+            keypoints[i].pt.x += minBorderX;
+            keypoints[i].pt.y += minBorderY;
+            keypoints[i].octave = level;
+            keypoints[i].size   = scaledPatchSize;
+        }
+
+        // 4. Orientation. Runs in parallel with the next stage's NPU work.
+        computeOrientation(mvImagePyramid[level], keypoints, umax);
+
+        g_hailo_counter.record(level, 0);
+    }
+
+    bool ORBextractor::RunHailoChain(const cv::Mat& image,
+        std::vector<std::vector<cv::KeyPoint>>& allKeypoints)
+    {
+        allKeypoints.assign(nlevels, std::vector<cv::KeyPoint>{});
+        PreallocatePyramidMats(image);
+
+        for (int level = 0; level < nlevels; ++level) {
+            mHailoStages[level]->SetOnComplete([this, level, &allKeypoints]() {
+                OnHailoStageComplete(level, allKeypoints);
+            });
+        }
+
+        if (!mHailoStages[0]->SubmitChain(mvImagePyramid[0])) {
+            return false;
+        }
+        return mHailoStages[nlevels - 1]->WaitForChain();
+    }
+
     void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint> >& allKeypoints)
     {
         allKeypoints.resize(nlevels);
@@ -1234,11 +1351,24 @@ namespace ORB_SLAM3
         Mat image = _image.getMat();
         assert(image.type() == CV_8UC1 );
 
-        // Pre-compute the scale pyramid
-        ComputePyramid(image);
-
         vector < vector<KeyPoint> > allKeypoints;
-        ComputeKeyPointsOctTree(allKeypoints);
+        // Fast path: if every pyramid level has a working Hailo stage, run
+        // the full chip-side pipeline (one Submit + one Wait, the rest is
+        // driven by HailoRT completion callbacks). Otherwise fall back to
+        // the legacy per-level sync path.
+        bool used_chain = false;
+        if (AllHailoStagesReady()) {
+            if (RunHailoChain(image, allKeypoints)) {
+                used_chain = true;
+            } else {
+                std::cerr << "[ORBextractor] Hailo chain failed; falling back to sync path\n";
+                allKeypoints.clear();
+            }
+        }
+        if (!used_chain) {
+            ComputePyramid(image);
+            ComputeKeyPointsOctTree(allKeypoints);
+        }
         //ComputeKeyPointsOld(allKeypoints);
 
         Mat descriptors;

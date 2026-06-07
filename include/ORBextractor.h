@@ -110,15 +110,27 @@ protected:
     std::vector<float> mvLevelSigma2;
     std::vector<float> mvInvLevelSigma2;
 
-    // One Hailo stage per pyramid level for which a HEF is available
-    // (currently L0..L3). Entries beyond this vector use cv::FAST on CPU.
+    // One Hailo stage per pyramid level for which a HEF is available.
+    // Entries beyond this vector use cv::FAST on CPU.
     std::vector<std::unique_ptr<HailoFeatureExtractor>> mHailoStages;
 
     // Per-frame, per-level outcome of the Hailo inference performed inside
-    // ComputePyramid(). 0=ok, 1=no_wrapper, 2=run_failed, 3=shape_mismatch.
-    // Read by ComputeKeyPointsOctTree() to decide whether to use the cached
-    // heatmap or fall back to cv::FAST.
+    // ComputePyramid() (legacy sync path). 0=ok, 1=no_wrapper, 2=run_failed,
+    // 3=shape_mismatch. Unused on the callback-chain path.
     std::vector<int> mHailoOutcomeThisFrame;
+
+    // Bordered backing storage for mvImagePyramid in the chain path:
+    // mvImagePyramid[L] is a sub-Mat of mPyramidTemps[L] with EDGE_THRESHOLD
+    // border around it (filled by copyMakeBorder so the descriptor / IC_Angle
+    // don't read uninitialised memory near keypoints at the edge).
+    std::vector<cv::Mat> mPyramidTemps;
+
+    bool AllHailoStagesReady() const;
+    void PreallocatePyramidMats(const cv::Mat& image);
+    bool RunHailoChain(const cv::Mat& image,
+                       std::vector<std::vector<cv::KeyPoint>>& allKeypoints);
+    void OnHailoStageComplete(int level,
+                              std::vector<std::vector<cv::KeyPoint>>& allKeypoints);
 };
 
 } //namespace ORB_SLAM

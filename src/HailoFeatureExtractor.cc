@@ -25,6 +25,13 @@ struct HailoFeatureExtractor::Impl
     std::vector<size_t> output_frame_sizes;
 
     std::vector<uint8_t> input_buffer;
+
+    // Bindings + job for the most-recent async submission. Must outlive the
+    // inference; replaced (and the previous one freed) when the next
+    // submission happens — by which time the previous inference's callback
+    // has already fired and returned, so it's safe to drop.
+    std::unique_ptr<hailort::ConfiguredInferModel::Bindings> current_bindings;
+    hailort::AsyncInferJob last_job;
 };
 
 HailoFeatureExtractor::HailoFeatureExtractor(const std::string& hef_path)
@@ -146,7 +153,7 @@ HailoFeatureExtractor::HailoFeatureExtractor(const std::string& hef_path)
 
 HailoFeatureExtractor::~HailoFeatureExtractor() = default;
 
-bool HailoFeatureExtractor::Run(const cv::Mat& gray)
+bool HailoFeatureExtractor::LoadInput(const cv::Mat& gray)
 {
     if (gray.empty()) return false;
 
@@ -180,24 +187,31 @@ bool HailoFeatureExtractor::Run(const cv::Mat& gray)
         return false;
     }
     std::memcpy(mImpl->input_buffer.data(), contiguous.data, expected_size);
+    return true;
+}
 
+bool HailoFeatureExtractor::SubmitWithCurrentInput()
+{
+    // Build a fresh Bindings object; previous one (if any) is dropped here,
+    // which is safe because its inference has already completed and its
+    // completion callback returned (that callback is what scheduled us).
     auto bindings_exp = mImpl->configured->create_bindings();
     if (!bindings_exp) {
         std::cerr << "[HailoFeatureExtractor] create_bindings failed, status = "
                   << bindings_exp.status() << "\n";
         return false;
     }
-    auto bindings = bindings_exp.release();
+    auto new_bindings = std::make_unique<hailort::ConfiguredInferModel::Bindings>(
+        bindings_exp.release());
 
-    auto in_status = bindings.input(mImpl->input_name)->set_buffer(
+    auto in_status = new_bindings->input(mImpl->input_name)->set_buffer(
         hailort::MemoryView(mImpl->input_buffer.data(), mImpl->input_frame_size));
     if (HAILO_SUCCESS != in_status) {
         std::cerr << "[HailoFeatureExtractor] set input buffer failed, status = " << in_status << "\n";
         return false;
     }
-
     for (size_t i = 0; i < mOutputs.size(); ++i) {
-        auto out_status = bindings.output(mOutputs[i].name)->set_buffer(
+        auto out_status = new_bindings->output(mOutputs[i].name)->set_buffer(
             hailort::MemoryView(mOutputs[i].data.data(), mImpl->output_frame_sizes[i]));
         if (HAILO_SUCCESS != out_status) {
             std::cerr << "[HailoFeatureExtractor] set output buffer '" << mOutputs[i].name
@@ -213,21 +227,134 @@ bool HailoFeatureExtractor::Run(const cv::Mat& gray)
         return false;
     }
 
-    auto job_exp = mImpl->configured->run_async(bindings);
+    auto job_exp = mImpl->configured->run_async(
+        *new_bindings,
+        [this](const hailort::AsyncInferCompletionInfo& info) {
+            HandleInferenceComplete(info.status);
+        });
     if (!job_exp) {
         std::cerr << "[HailoFeatureExtractor] run_async failed, status = "
                   << job_exp.status() << "\n";
         return false;
     }
+
+    mImpl->current_bindings = std::move(new_bindings);
     auto job = job_exp.release();
-    auto job_status = job.wait(std::chrono::milliseconds(5000));
-    if (HAILO_SUCCESS != job_status) {
-        std::cerr << "[HailoFeatureExtractor] job.wait failed, status = " << job_status << "\n";
-        return false;
+    job.detach();
+    mImpl->last_job = std::move(job);
+    return true;
+}
+
+void HailoFeatureExtractor::HandleInferenceComplete(int status)
+{
+    if (HAILO_SUCCESS != status) {
+        std::cerr << "[HailoFeatureExtractor] async inference failed, status = "
+                  << status << "\n";
+        mChainOk.store(false, std::memory_order_relaxed);
     }
 
+    // Submit the next stage FIRST, so its NPU work overlaps with this stage's
+    // CPU-side OnComplete callback below. The next stage's input is just this
+    // stage's resize1 output buffer; we memcpy it in.
+    if (mNext && mChainOk.load(std::memory_order_relaxed)) {
+        if (mResizeOutputIndex < 0) {
+            std::cerr << "[HailoFeatureExtractor] chain: no resize output to feed next stage\n";
+            mChainOk.store(false, std::memory_order_relaxed);
+        } else {
+            const auto& resize_ob = mOutputs[mResizeOutputIndex];
+            const size_t need = mNext->mImpl->input_frame_size;
+            const size_t have = resize_ob.data.size();
+            if (have < need) {
+                std::cerr << "[HailoFeatureExtractor] chain: resize output ("
+                          << have << "B) smaller than next input (" << need << "B)\n";
+                mChainOk.store(false, std::memory_order_relaxed);
+            } else {
+                std::memcpy(mNext->mImpl->input_buffer.data(),
+                            resize_ob.data.data(),
+                            need);
+                if (!mNext->SubmitWithCurrentInput()) {
+                    mChainOk.store(false, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
+    // Run this stage's user callback (keypoint extraction, mvImagePyramid
+    // populate, ...). Runs in parallel with the NPU work for the next stage.
+    if (mOnComplete) {
+        try { mOnComplete(); }
+        catch (const std::exception& e) {
+            std::cerr << "[HailoFeatureExtractor] OnComplete threw: " << e.what() << "\n";
+            mChainOk.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    // Signal completion for THIS stage. WaitForChain walks the chain and
+    // waits for every stage's mDone, so the main thread only resumes after
+    // every callback has returned (no race on shared per-stage state).
+    {
+        std::lock_guard<std::mutex> lock(mDoneMu);
+        mDone = true;
+        mDoneCv.notify_all();
+    }
     ++mFrameCount;
-    return true;
+}
+
+void HailoFeatureExtractor::SetNext(HailoFeatureExtractor* next)
+{
+    mNext = next;
+}
+
+void HailoFeatureExtractor::SetOnComplete(CompletionCallback cb)
+{
+    mOnComplete = std::move(cb);
+}
+
+bool HailoFeatureExtractor::SubmitChain(const cv::Mat& input)
+{
+    if (!LoadInput(input)) return false;
+
+    // Propagate "we're starting; nobody has signalled yet" to every stage of
+    // the chain reachable from here. Whichever stage doesn't submit a next
+    // stage (i.e., the last one to complete on this frame) will be the one to
+    // signal — and from this stage's WaitForChain perspective that's the only
+    // one we care about, but we initialize them all defensively in case the
+    // chain breaks midway.
+    for (HailoFeatureExtractor* s = this; s; s = s->mNext) {
+        std::lock_guard<std::mutex> lock(s->mDoneMu);
+        s->mDone = false;
+        s->mChainOk.store(true, std::memory_order_relaxed);
+    }
+
+    return SubmitWithCurrentInput();
+}
+
+bool HailoFeatureExtractor::WaitForChain(int timeout_ms)
+{
+    // Walk the chain — wait for every stage's mDone. This ensures every
+    // stage's user callback has fully returned before the caller can read
+    // any shared per-frame state (allKeypoints, mvImagePyramid, ...).
+    for (HailoFeatureExtractor* s = this; s; s = s->mNext) {
+        std::unique_lock<std::mutex> lock(s->mDoneMu);
+        if (!s->mDoneCv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                  [s] { return s->mDone; })) {
+            return false;
+        }
+    }
+    return mChainOk.load(std::memory_order_relaxed);
+}
+
+bool HailoFeatureExtractor::Run(const cv::Mat& gray)
+{
+    // Legacy sync API: submit + block. Chain disabled.
+    auto saved_next = mNext;
+    auto saved_cb   = std::move(mOnComplete);
+    mNext = nullptr;
+    mOnComplete = nullptr;
+    bool ok = SubmitChain(gray) && WaitForChain(5000);
+    mNext = saved_next;
+    mOnComplete = std::move(saved_cb);
+    return ok;
 }
 
 cv::Mat HailoFeatureExtractor::GetHeatmap()
