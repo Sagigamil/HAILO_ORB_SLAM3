@@ -843,21 +843,19 @@ namespace ORB_SLAM3
         return vResultKeys;
     }
 
-    // The HEF's ew_mult1 output is heatmap * NMS_mask: non-maxima are 0,
-    // surviving peaks keep their response value. So we just threshold + emit.
-    // No CPU-side 3x3 NMS needed.
+    // The HEF's heatmap output is post-NMS *and* post-threshold: non-corner
+    // pixels are 0, surviving corners keep their response value. So we just
+    // emit any non-zero pixel — no NMS or threshold on the CPU.
     static void ExtractKeypointsFromHailoHeatmap(
         const cv::Mat& heat,
         int minBorderX, int maxBorderX,
         int minBorderY, int maxBorderY,
-        int threshold,
         std::vector<cv::KeyPoint>& vToDistributeKeys)
     {
         const int x0 = std::max(minBorderX, 0);
         const int x1 = std::min(maxBorderX, heat.cols);
         const int y0 = std::max(minBorderY, 0);
         const int y1 = std::min(maxBorderY, heat.rows);
-        const uchar th = static_cast<uchar>(std::max(0, std::min(255, threshold)));
         const int step = static_cast<int>(heat.step);
         const uchar* base = heat.ptr<uchar>(0);
 
@@ -865,7 +863,7 @@ namespace ORB_SLAM3
             const uchar* row = base + y * step;
             for (int x = x0; x < x1; ++x) {
                 const uchar v = row[x];
-                if (v < th) continue;
+                if (v == 0) continue;
                 vToDistributeKeys.emplace_back(
                     static_cast<float>(x - minBorderX),
                     static_cast<float>(y - minBorderY),
@@ -956,12 +954,7 @@ namespace ORB_SLAM3
         vToDistributeKeys.reserve(nfeatures * 10);
         ExtractKeypointsFromHailoHeatmap(heat, minBorderX, maxBorderX,
                                          minBorderY, maxBorderY,
-                                         iniThFAST, vToDistributeKeys);
-        if (vToDistributeKeys.empty()) {
-            ExtractKeypointsFromHailoHeatmap(heat, minBorderX, maxBorderX,
-                                             minBorderY, maxBorderY,
-                                             minThFAST, vToDistributeKeys);
-        }
+                                         vToDistributeKeys);
 
         // 3. OctTree distribution + finalise coords.
         auto& keypoints = allKeypoints[level];
@@ -1000,7 +993,11 @@ namespace ORB_SLAM3
         if (!mHailoStages[0]->SubmitChain(mvImagePyramid[0])) {
             return false;
         }
-        return mHailoStages[nlevels - 1]->WaitForChain();
+        // Wait on the FIRST stage — WaitForChain walks forward via mNext and
+        // blocks until every stage's mDone (and so every user callback) has
+        // fully returned. Calling it on the last stage would only wait for
+        // that one (mNext = nullptr), racing with earlier callbacks.
+        return mHailoStages[0]->WaitForChain();
     }
 
     void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint> >& allKeypoints)
@@ -1037,12 +1034,7 @@ namespace ORB_SLAM3
                     } else {
                         ExtractKeypointsFromHailoHeatmap(
                             heat, minBorderX, maxBorderX, minBorderY, maxBorderY,
-                            iniThFAST, vToDistributeKeys);
-                        if (vToDistributeKeys.empty()) {
-                            ExtractKeypointsFromHailoHeatmap(
-                                heat, minBorderX, maxBorderX, minBorderY, maxBorderY,
-                                minThFAST, vToDistributeKeys);
-                        }
+                            vToDistributeKeys);
                         hailo_used = true;
                         g_hailo_counter.record(level, 0);
                     }
